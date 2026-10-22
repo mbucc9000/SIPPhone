@@ -1,0 +1,17 @@
+#!/bin/sh
+# Start sipphoned on a fresh install, and restart it on the new binary after an
+# upgrade (the old one keeps running under KeepAlive otherwise). prerm already
+# unloaded it on upgrade; the wait covers its 3 s unregister-before-exit.
+P=/Library/LaunchDaemons/com.mbucc9000.sipphoned.plist
+case "$1" in
+configure|abort-upgrade|abort-remove|abort-deconfigure)
+    launchctl unload "$P" 2>/dev/null
+    i=0
+    while [ $i -lt 5 ] && killall -0 sipphoned 2>/dev/null; do
+        sleep 1
+        i=$((i+1))
+    done
+    launchctl load "$P"
+    ;;
+esac
+exit 0

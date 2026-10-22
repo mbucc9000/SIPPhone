@@ -1,0 +1,8 @@
+#!/bin/sh
+# Remove runtime leftovers on uninstall. Account prefs are kept for a reinstall.
+case "$1" in
+remove|purge)
+    rm -f /var/run/sipphone.sock /var/mobile/Library/Preferences/com.mbucc9000.sipphone.state.plist
+    ;;
+esac
+exit 0

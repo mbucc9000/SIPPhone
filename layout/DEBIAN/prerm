@@ -1,0 +1,10 @@
+#!/bin/sh
+# Stop sipphoned before its files go away. launchctl unload sends SIGTERM, and
+# the daemon unregisters from the SIP server before exiting.
+P=/Library/LaunchDaemons/com.mbucc9000.sipphoned.plist
+case "$1" in
+remove|purge|upgrade|deconfigure|failed-upgrade)
+    launchctl unload "$P" 2>/dev/null
+    ;;
+esac
+exit 0

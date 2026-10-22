@@ -1,0 +1,36 @@
+<img src="icon.png" width="80" align="right" alt="">
+
+# SIP Phone
+
+Make and receive VoIP.ms calls through the stock iOS 6 Phone app, with a stock-style call screen, your ringtone and clean earpiece audio.
+
+## Features
+
+- Dial from the stock Phone app and the call goes over SIP. 911 and other emergency numbers stay on cellular.
+- Incoming calls ring with your ringtone, wake the screen and show a stock-style call screen on your wallpaper. Slide to answer when locked.
+- Mute, keypad, speaker and hold during a call.
+- Clean earpiece audio: Auto mode turns iOS's choppy echo suppressor off on the earpiece and keeps it for speaker.
+
+## How to use
+
+1. On voip.ms, create a sub-account. For incoming calls, get a number (DID) and route it to that sub-account.
+2. Settings › SIP Phone: enter the server (like chicago4.voip.ms), the sub-account and its password, then turn on SIP enabled. Status shows Registered.
+3. Dial from the Phone app as usual. Call 4443 for VoIP.ms's echo test.
+
+## Requirements
+
+- Jailbroken iOS 6 (tested on an iPhone 5 with iOS 6.1.2)
+- Cydia Substrate and PreferenceLoader (Cydia installs them for you)
+- A VoIP.ms account (a sub-account and a server like chicago4.voip.ms)
+
+## Install
+
+In Cydia, add `https://mbucc9000.github.io/slopkit/` and install **SIP Phone**. Or download the `.deb` from [Releases](../../releases) and install it with `dpkg -i`.
+
+## Building
+
+[Theos](https://theos.dev) with the iOS 6.1 SDK: `make package FINALPACKAGE=1`.
+
+## License
+
+MIT.
