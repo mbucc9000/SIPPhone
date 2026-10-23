@@ -57,6 +57,13 @@ items = [
     switch("SIP enabled", "enabled", False),
     switch("Route Phone app calls", "routeAllCalls", True),
 
+    group("Security", "Encrypted calls use TLS for the connection and SRTP for the audio, so the "
+                      "login, the numbers you dial and the call itself can't be read on the network. "
+                      "Turn on “Encrypted SIP Traffic” for this sub-account at voip.ms first, or "
+                      "calls stop working. Uses port 5061. Without this, SIP Phone still works but the "
+                      "connection and audio are unencrypted."),
+    switch("Encrypted calls", "encryptCalls", False),
+
     group("Bluetooth", "Lets AirPods or another Bluetooth headset carry calls. Off by default: "
                        "AirPods Pro 3 on iOS 6 can't hold the call-audio link, and if it stalls "
                        "SIP Phone moves the call back to the iPhone."),

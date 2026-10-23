@@ -10,6 +10,7 @@
 int64_t  sp_now_ms(void);          /* monotonic milliseconds */
 uint32_t sp_rand32(void);
 void     sp_rand_hex(char *out, int nchars);   /* nchars hex digits + NUL */
+void     sp_rand_bytes(uint8_t *out, size_t n);  /* CSPRNG bytes (keys/salts) */
 
 /* Log sink. The daemon points it at a file; tests leave it on stderr. */
 void sp_log_open(const char *path);

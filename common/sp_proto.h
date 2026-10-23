@@ -61,5 +61,6 @@
 #define SP_PK_DEBUG      "debugLog"       /* 1 = full SIP messages in the log (auth redacted) */
 #define SP_PK_BTHEADSET  "btHeadset"      /* 1 = let a Bluetooth headset (HFP) carry calls; off by default */
 #define SP_PK_AUDIO      "audioMode"      /* 0 auto (VP off on the earpiece), 1 always VP, 2 never VP */
+#define SP_PK_ENCRYPT    "encryptCalls"   /* 1 = SIP over TLS + SRTP (needs "Encrypted SIP Traffic" at VoIP.ms) */
 
 #endif

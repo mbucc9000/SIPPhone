@@ -1,6 +1,7 @@
 #include "sp_ua.h"
 #include "sp_sip.h"
 #include "sp_sdp.h"
+#include "sp_srtp.h"
 #include "sp_md5.h"
 #include "sp_util.h"
 
@@ -69,6 +70,11 @@ typedef struct {
     sp_sdp   rsdp;
     int      have_rsdp;
     int      pt, dtmf_pt, local_hold, media_on;
+    int      secure;                        /* SRTP (SDES) negotiated for this call */
+    int      crypto_tag;                    /* the a=crypto tag we send */
+    uint8_t  tx_key[SP_SDES_KEYING];        /* our inline key: encrypts what we send */
+    uint8_t  rx_key[SP_SDES_KEYING];        /* peer's inline key: decrypts what we receive */
+    int      have_rx_key;
     uint32_t sess_id, sdp_ver;
     char     number[64], display[96], reason[96];
     int      status, answered;
@@ -117,7 +123,19 @@ static void changed(sp_ua *ua)
 
 static int is_tcp(const sp_ua *ua)
 {
-    return ua->cfg.transport == SP_TP_TCP;
+    return ua->cfg.transport != SP_TP_UDP;   /* TCP and TLS both use stream framing */
+}
+
+/* SIP transport token for Via, and the Contact ;transport= param */
+static const char *tp_via(const sp_ua *ua)
+{
+    return ua->cfg.transport == SP_TP_TLS ? "TLS" : ua->cfg.transport == SP_TP_TCP ? "TCP" : "UDP";
+}
+
+static const char *tp_contact(const sp_ua *ua)
+{
+    return ua->cfg.transport == SP_TP_TLS ? ";transport=tls"
+         : ua->cfg.transport == SP_TP_TCP ? ";transport=tcp" : "";
 }
 
 static void new_branch(char out[48])
@@ -154,7 +172,7 @@ static void contact_hv(const sp_ua *ua, char *out, size_t n)
     int port;
     const char *host = contact_host(ua, &port);
     snprintf(out, n, "<sip:%s@%s:%d%s>", ua->cfg.user, host, port,
-             is_tcp(ua) ? ";transport=tcp" : "");
+             tp_contact(ua));
 }
 
 static void aor(const sp_ua *ua, char *out, size_t n)
@@ -267,7 +285,7 @@ static char *build_req(sp_ua *ua, const char *method, const char *ruri, const ch
     sp_buf b;
     sp_buf_init(&b);
     sp_buf_printf(&b, "%s %s SIP/2.0\r\n", method, ruri);
-    sp_buf_printf(&b, "Via: SIP/2.0/%s %s:%d;branch=%s;rport\r\n", is_tcp(ua) ? "TCP" : "UDP",
+    sp_buf_printf(&b, "Via: SIP/2.0/%s %s:%d;branch=%s;rport\r\n", tp_via(ua),
                   ua->local_ip[0] ? ua->local_ip : "0.0.0.0", ua->local_port, branch);
     sp_buf_puts(&b, "Max-Forwards: 70\r\n");
     for (int i = 0; i < nroutes; i++)
@@ -410,9 +428,23 @@ static void media_apply(sp_ua *ua)
     sp_call *c = &ua->c;
     if (!c->have_rsdp || c->pt < 0 || c->rsdp.port <= 0)
         return;
+    if (c->secure && !c->have_rx_key)       /* fail-closed: never send media in the clear */
+        return;
     int dir = sp_sdp_answer_dir(c->rsdp.dir, c->local_hold);
-    if (ua->h.media)
-        ua->h.media(ua->h.ctx, 1, c->rsdp.ip, c->rsdp.port, c->pt, c->dtmf_pt, dir);
+    if (ua->h.media) {
+        sp_media_info m;
+        memset(&m, 0, sizeof m);
+        m.on = 1;
+        m.ip = c->rsdp.ip;
+        m.port = c->rsdp.port;
+        m.pt = c->pt;
+        m.dtmf_pt = c->dtmf_pt;
+        m.dir = dir;
+        m.secure = c->secure;
+        m.tx_key = c->secure ? c->tx_key : NULL;
+        m.rx_key = c->secure ? c->rx_key : NULL;
+        ua->h.media(ua->h.ctx, &m);
+    }
     c->media_on = 1;
 }
 
@@ -421,8 +453,12 @@ static void media_stop(sp_ua *ua)
     sp_call *c = &ua->c;
     if (ua->h.tone)
         ua->h.tone(ua->h.ctx, SP_TONE_NONE);
-    if (c->media_on && ua->h.media)
-        ua->h.media(ua->h.ctx, 0, NULL, 0, -1, -1, 0);
+    if (c->media_on && ua->h.media) {
+        sp_media_info m;
+        memset(&m, 0, sizeof m);
+        m.pt = m.dtmf_pt = -1;
+        ua->h.media(ua->h.ctx, &m);     /* on = 0 */
+    }
     c->media_on = 0;
 }
 
@@ -431,14 +467,15 @@ static void local_sdp(sp_ua *ua, char *out, size_t n, int answer)
     sp_call *c = &ua->c;
     int port;
     const char *ip = contact_host(ua, &port);
+    const uint8_t *key = c->secure ? c->tx_key : NULL;
     if (answer && c->pt >= 0) {
         int pts[1] = { c->pt };
         sp_sdp_build(out, n, ip, ua->rtp_port, c->sess_id, c->sdp_ver, pts, 1, c->rsdp.dtmf_pt,
-                     sp_sdp_answer_dir(c->rsdp.dir, c->local_hold));
+                     sp_sdp_answer_dir(c->rsdp.dir, c->local_hold), key, c->crypto_tag);
     } else {
         int pts[2] = { 0, 8 };
         sp_sdp_build(out, n, ip, ua->rtp_port, c->sess_id, c->sdp_ver, pts, 2, DTMF_PT,
-                     c->local_hold ? SP_DIR_SENDONLY : SP_DIR_SENDRECV);
+                     c->local_hold ? SP_DIR_SENDONLY : SP_DIR_SENDRECV, key, c->crypto_tag);
     }
 }
 
@@ -457,12 +494,21 @@ static int take_sdp(sp_ua *ua, const sp_msg *m)
     int pt = sp_sdp_choose(&s);
     if (pt < 0)
         return -2;
+    if (c->secure) {
+        /* fail-closed: an encrypted call must carry SRTP keying, never plaintext */
+        if (!s.savp || !s.have_crypto) {
+            sp_log("remote offered no SRTP on a secure call: rejecting");
+            return -2;
+        }
+        memcpy(c->rx_key, s.crypto_key, SP_SDES_KEYING);
+        c->have_rx_key = 1;
+    }
     c->rsdp = s;
     c->have_rsdp = 1;
     c->pt = pt;
     c->dtmf_pt = s.dtmf_pt;
-    sp_log("remote media %s:%d pt %d dtmf %d %s", s.ip, s.port, pt, s.dtmf_pt,
-           sp_sdp_dir_name(s.dir));
+    sp_log("remote media %s:%d pt %d dtmf %d %s%s", s.ip, s.port, pt, s.dtmf_pt,
+           sp_sdp_dir_name(s.dir), c->secure ? " [SRTP]" : "");
     return 0;
 }
 
@@ -477,6 +523,18 @@ static void call_reset(sp_ua *ua)
         sp_msg_free(&c->inv);
     memset(c, 0, sizeof *c);
     c->pt = c->dtmf_pt = -1;
+}
+
+/* Per-call SRTP state: our own key for what we send; the peer's comes from its SDP. */
+static void call_secure_setup(sp_ua *ua)
+{
+    sp_call *c = &ua->c;
+    c->secure = ua->cfg.secure ? 1 : 0;
+    c->have_rx_key = 0;
+    if (c->secure) {
+        sp_rand_bytes(c->tx_key, SP_SDES_KEYING);
+        c->crypto_tag = 1;
+    }
 }
 
 static void call_end(sp_ua *ua, const char *reason, int status)
@@ -1027,6 +1085,7 @@ static void on_new_invite(sp_ua *ua, sp_msg *m)
     }
     sp_call *c = &ua->c;
     call_reset(ua);
+    call_secure_setup(ua);
     int sr = take_sdp(ua, m);
     if (sr == -2) {
         send_resp(ua, m, 488, "Not Acceptable Here", tag, 0, NULL, NULL, NULL);
@@ -1485,6 +1544,7 @@ int sp_ua_dial(sp_ua *ua, const char *number)
     if (sp_ua_busy(ua))
         return -1;
     call_reset(ua);
+    call_secure_setup(ua);
     sp_call *c = &ua->c;
     c->id = ++ua->next_id;
     c->incoming = 0;

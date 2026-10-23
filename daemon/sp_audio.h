@@ -17,6 +17,10 @@ void      sp_audio_free(sp_audio *a);
 
 enum { SP_AU_TONE_NONE = 0, SP_AU_TONE_RINGBACK, SP_AU_TONE_BUSY };
 
+/* Enable SRTP for the call (30-byte SDES keys), or pass NULL,NULL to send plain RTP.
+   Set before sp_audio_start / sp_audio_reconfigure. */
+void sp_audio_set_srtp(sp_audio *a, const uint8_t *tx_key, const uint8_t *rx_key);
+
 /* Start/stop the call audio. codec_pt is SP_PT_PCMU/PCMA, dtmf_pt or -1. */
 int  sp_audio_start(sp_audio *a, int codec_pt, int dtmf_pt, int sending, int recving);
 /* Re-key the RTP stream once the real codec is negotiated (keeps the unit up). */

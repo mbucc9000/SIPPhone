@@ -4,9 +4,10 @@ ARCHS = armv7 armv7s
 include $(THEOS)/makefiles/common.mk
 
 TOOL_NAME = sipphoned
-sipphoned_FILES = main.c sp_util.c sp_md5.c sp_sip.c sp_sdp.c sp_rtp.c sp_ua.c sp_audio.c
+sipphoned_FILES = main.c sp_util.c sp_md5.c sp_sip.c sp_sdp.c sp_rtp.c sp_ua.c sp_audio.c \
+	sp_sha1.c sp_aes.c sp_srtp.c sp_tls.c
 sipphoned_CFLAGS = -std=c11 -Wall -I../common -fno-objc-arc
-sipphoned_FRAMEWORKS = CoreFoundation AudioToolbox
+sipphoned_FRAMEWORKS = CoreFoundation AudioToolbox Security
 sipphoned_INSTALL_PATH = /usr/libexec
 
 include $(THEOS)/makefiles/tool.mk

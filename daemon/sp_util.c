@@ -84,6 +84,20 @@ void sp_rand_hex(char *out, int nchars)
     out[nchars] = 0;
 }
 
+void sp_rand_bytes(uint8_t *out, size_t n)
+{
+#if defined(__APPLE__)
+    arc4random_buf(out, n);                  /* CSPRNG, seeded by the kernel */
+#else
+    size_t i = 0;
+    while (i < n) {
+        uint32_t v = sp_rand32();
+        for (int b = 0; b < 4 && i < n; b++)
+            out[i++] = (uint8_t)(v >> (8 * b));
+    }
+#endif
+}
+
 /* ---- log ---- */
 
 static FILE *g_log;
@@ -112,6 +126,10 @@ void sp_log_open(const char *path)
         fclose(g_log);
     sp_strlcpy(g_log_path, path ? path : "", sizeof g_log_path);
     g_log = path ? fopen(path, "a") : NULL;
+#ifndef _WIN32
+    if (g_log)
+        chmod(path, 0600);               /* call history lives in here: root only */
+#endif
     log_unlock();
 }
 
@@ -127,6 +145,10 @@ static void log_rotate_locked(void)
     fclose(g_log);
     rename(g_log_path, old);
     g_log = fopen(g_log_path, "a");
+#ifndef _WIN32
+    if (g_log)
+        chmod(g_log_path, 0600);
+#endif
 }
 
 static void log_prefix(FILE *f)

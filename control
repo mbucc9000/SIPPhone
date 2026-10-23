@@ -1,6 +1,6 @@
 Package: com.mbucc9000.sipphone
 Name: SIP Phone
-Version: 1.0.14
+Version: 1.1.0
 Architecture: iphoneos-arm
 Description: Make and receive VoIP.ms (SIP) calls through the stock Phone app. Dial as usual and the call goes over SIP; emergency numbers stay on cellular. Incoming calls ring with your ringtone, wake the screen and show a stock-style call screen. Needs a VoIP.ms account. Settings > SIP Phone.
 Author: mbucc9000

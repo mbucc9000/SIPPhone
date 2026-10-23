@@ -1,4 +1,5 @@
 #include "sp_audio.h"
+#include "sp_srtp.h"
 #include "sp_util.h"
 
 #include <stdio.h>
@@ -6,6 +7,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <math.h>
 
 #include <AudioToolbox/AudioToolbox.h>
@@ -54,6 +56,10 @@ struct sp_audio {
     uint32_t    cap_mic_n, cap_spk_n;
     pthread_mutex_t lock;
     sp_rtp      rtp;
+
+    int         srtp_on;        /* protect/unprotect each packet with SRTP */
+    sp_srtp     srtp_tx, srtp_rx;
+    uint32_t    srtp_drop;      /* inbound packets rejected by SRTP auth */
 
     /* mic framer: accumulate hardware callback samples into 160-sample frames */
     int16_t     mic_acc[SP_SAMPLES * 4];
@@ -270,6 +276,8 @@ static OSStatus input_cb(void *ref, AudioUnitRenderActionFlags *flags, const Aud
             uint8_t pkt[256];
             int n = sp_rtp_build(&a->rtp, a->mic_acc, pkt, sizeof pkt);
             a->mic_fill = 0;
+            if (n > 0 && a->srtp_on)
+                n = sp_srtp_protect(&a->srtp_tx, pkt, n, sizeof pkt);   /* encrypt + auth tag */
             if (n > 0 && a->tx) {
                 pthread_mutex_unlock(&a->lock);
                 a->tx(a->ctx, pkt, n);          /* sendto outside the lock */
@@ -646,9 +654,14 @@ static void put16(FILE *f, uint16_t v)
 /* 8 kHz mono 16-bit PCM WAV (the device is little-endian, like WAV) */
 static void write_wav(const char *path, const int16_t *pcm, uint32_t n)
 {
-    FILE *f = fopen(path, "wb");
-    if (!f)
+    unlink(path);
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);   /* root only */
+    FILE *f = fd >= 0 ? fdopen(fd, "wb") : NULL;
+    if (!f) {
+        if (fd >= 0)
+            close(fd);
         return;
+    }
     fwrite("RIFF", 1, 4, f);
     put32(f, 36 + n * 2);
     fwrite("WAVEfmt ", 1, 8, f);
@@ -750,11 +763,39 @@ void sp_audio_send_dtmf(sp_audio *a, char digit)
 void sp_audio_rtp_in(sp_audio *a, const uint8_t *pkt, int len)
 {
     pthread_mutex_lock(&a->lock);
+    uint8_t dec[2048];
+    if (a->srtp_on) {
+        if (len > (int)sizeof dec) {
+            pthread_mutex_unlock(&a->lock);
+            return;
+        }
+        memcpy(dec, pkt, (size_t)len);
+        len = sp_srtp_unprotect(&a->srtp_rx, dec, len);   /* verify tag + decrypt, or -1 */
+        if (len < 0) {
+            a->srtp_drop++;
+            pthread_mutex_unlock(&a->lock);
+            return;                                       /* forged / replayed / wrong key: drop */
+        }
+        pkt = dec;
+    }
     uint32_t before = a->rtp.rx_pkts;
     sp_rtp_recv(&a->rtp, pkt, (size_t)len);
     if (a->tone == SP_AU_TONE_RINGBACK && a->rtp.rx_pkts != before) {
         a->tone = SP_AU_TONE_NONE;        /* real early media arrived: play it; mic opens next frame */
         a->play_pos = SP_SAMPLES;
+    }
+    pthread_mutex_unlock(&a->lock);
+}
+
+void sp_audio_set_srtp(sp_audio *a, const uint8_t *tx_key, const uint8_t *rx_key)
+{
+    pthread_mutex_lock(&a->lock);
+    if (tx_key && rx_key) {
+        sp_srtp_init(&a->srtp_tx, tx_key);
+        sp_srtp_init(&a->srtp_rx, rx_key);
+        a->srtp_on = 1;
+    } else {
+        a->srtp_on = 0;
     }
     pthread_mutex_unlock(&a->lock);
 }

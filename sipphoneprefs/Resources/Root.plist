@@ -182,6 +182,24 @@
 			<key>cell</key>
 			<string>PSGroupCell</string>
 			<key>footerText</key>
+			<string>Encrypted calls use TLS for the connection and SRTP for the audio, so the login, the numbers you dial and the call itself can't be read on the network. Turn on “Encrypted SIP Traffic” for this sub-account at voip.ms first, or calls stop working. Uses port 5061. Without this, SIP Phone still works but the connection and audio are unencrypted.</string>
+			<key>label</key>
+			<string>Security</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>default</key>
+			<false/>
+			<key>key</key>
+			<string>encryptCalls</string>
+			<key>label</key>
+			<string>Encrypted calls</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>footerText</key>
 			<string>Lets AirPods or another Bluetooth headset carry calls. Off by default: AirPods Pro 3 on iOS 6 can't hold the call-audio link, and if it stalls SIP Phone moves the call back to the iPhone.</string>
 			<key>label</key>
 			<string>Bluetooth</string>

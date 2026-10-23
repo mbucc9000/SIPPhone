@@ -24,6 +24,7 @@ typedef struct {
     int  tx_n;
     int  media_on, media_pt, media_dtmf, media_dir, media_port;
     char media_ip[64];
+    int  media_secure;
     int  tone;
     int  changes;
 } caps;
@@ -68,15 +69,16 @@ static void h_send(void *ctx, const char *data, size_t len)
 
 static void h_changed(void *ctx) { (void)ctx; g_cap.changes++; }
 
-static void h_media(void *ctx, int on, const char *ip, int port, int pt, int dtmf, int dir)
+static void h_media(void *ctx, const sp_media_info *m)
 {
     (void)ctx;
-    g_cap.media_on = on;
-    g_cap.media_pt = pt;
-    g_cap.media_dtmf = dtmf;
-    g_cap.media_dir = dir;
-    g_cap.media_port = port;
-    sp_strlcpy(g_cap.media_ip, ip ? ip : "", sizeof g_cap.media_ip);
+    g_cap.media_on = m->on;
+    g_cap.media_pt = m->pt;
+    g_cap.media_dtmf = m->dtmf_pt;
+    g_cap.media_dir = m->dir;
+    g_cap.media_port = m->port;
+    g_cap.media_secure = m->secure;
+    sp_strlcpy(g_cap.media_ip, m->ip ? m->ip : "", sizeof g_cap.media_ip);
 }
 
 static void h_tone(void *ctx, int tone) { (void)ctx; g_cap.tone = tone; }

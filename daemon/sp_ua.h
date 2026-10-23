@@ -7,7 +7,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-enum { SP_TP_UDP = 0, SP_TP_TCP = 1 };
+enum { SP_TP_UDP = 0, SP_TP_TCP = 1, SP_TP_TLS = 2 };
 
 typedef struct {
     char server[128];      /* registrar/proxy host, also the SIP domain */
@@ -20,6 +20,7 @@ typedef struct {
     int  do_register;
     int  expires;          /* requested registration lifetime, seconds */
     char user_agent[64];
+    int  secure;           /* require SIP over TLS + SRTP (SDES); fail-closed, never downgrade */
 } sp_cfg;
 
 enum { SP_REG_OFF = 0, SP_REG_TRYING, SP_REG_OK, SP_REG_FAILED };
@@ -35,12 +36,22 @@ enum {
 
 enum { SP_TONE_NONE = 0, SP_TONE_RINGBACK, SP_TONE_BUSY };
 
+/* Media parameters passed to the audio layer when a call's RTP should start/stop.
+   When secure, tx_key/rx_key point at 30-byte SDES keys valid for this callback. */
+typedef struct {
+    int         on;        /* 0 = stop media */
+    const char *ip;
+    int         port, pt, dtmf_pt, dir;   /* dir is OUR direction (SP_DIR_*) */
+    int         secure;    /* SRTP */
+    const uint8_t *tx_key; /* encrypts what we send; NULL if !secure */
+    const uint8_t *rx_key; /* decrypts what we receive */
+} sp_media_info;
+
 typedef struct {
     void *ctx;
     void (*send)(void *ctx, const char *data, size_t len);
     void (*changed)(void *ctx);
-    /* on=0 stops media. dir is OUR direction (SP_DIR_*). */
-    void (*media)(void *ctx, int on, const char *ip, int port, int pt, int dtmf_pt, int dir);
+    void (*media)(void *ctx, const sp_media_info *m);
     void (*tone)(void *ctx, int tone);
 } sp_hooks;
 

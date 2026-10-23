@@ -6,6 +6,7 @@
 #include "sp_sdp.h"
 #include "sp_rtp.h"
 #include "sp_audio.h"
+#include "sp_tls.h"
 #include "sp_util.h"
 #include "../common/sp_proto.h"
 
@@ -20,6 +21,7 @@
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/types.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -29,7 +31,8 @@
 
 #define MAX_CLIENTS 8
 #define RTP_PORT_BASE 40000
-#define SP_STRICT_SOURCE 0   /* 1 = drop SIP/RTP from unexpected IPs. Only after the log shows none legit. */
+#define SP_STRICT_SOURCE 1   /* drop SIP not from the server and RTP not from the negotiated media address */
+#define MOBILE_UID 501        /* SpringBoard, MobilePhone and Preferences run as mobile */
 #define NOTIFY_NET_CHANGE "com.apple.system.config.network_change"
 
 typedef struct {
@@ -37,8 +40,10 @@ typedef struct {
     sp_audio *audio;
     sp_cfg   cfg;
 
-    int      sip_fd;          /* UDP or TCP, -1 while down */
+    int      sip_fd;          /* UDP or TCP/TLS, -1 while down */
     int      tcp_connected, tcp_connecting;
+    sp_tls  *tls;             /* set when transport is TLS and the handshake is done/running */
+    int      tls_handshaking;
     char     tcp_rxbuf[16384];
     size_t   tcp_rxlen;
     int64_t  sip_retry_at;    /* reopen the SIP transport at this time, 0 = none */
@@ -67,6 +72,8 @@ typedef struct {
 
     int      audio_up;
     int      media_on, media_pt, media_dtmf, media_send, media_recv;   /* last negotiated media */
+    int      media_secure;                               /* SRTP for this call */
+    uint8_t  media_tx_key[SP_SDES_KEYING], media_rx_key[SP_SDES_KEYING];
     int64_t  audio_retry_at, watchdog_at;
     int      muted, speaker;
     int      audio_mode;             /* Settings > Call audio */
@@ -173,6 +180,12 @@ static void load_prefs(app *a)
     c.transport = cf_int(d, SP_PK_TRANSPORT, 0);
     c.expires = cf_int(d, SP_PK_EXPIRES, 300);
     c.do_register = cf_int(d, SP_PK_ENABLED, 0);
+    c.secure = cf_int(d, SP_PK_ENCRYPT, 0);
+    if (c.secure) {
+        c.transport = SP_TP_TLS;        /* VoIP.ms encryption = TLS signaling + SRTP media together */
+        if (!c.port)
+            c.port = 5061;
+    }
     sp_log_verbose = cf_int(d, SP_PK_DEBUG, 0);     /* off unless Settings > Troubleshooting turns it on */
     a->audio_mode = cf_int(d, SP_PK_AUDIO, 0);
     a->bt_headset = cf_int(d, SP_PK_BTHEADSET, 0);
@@ -180,8 +193,8 @@ static void load_prefs(app *a)
     a->cfg = c;
     if (d)
         CFRelease(d);
-    sp_log("prefs: server=%s user=%s enabled=%d transport=%d verbose=%d audio=%d", c.server, c.user,
-           c.do_register, c.transport, sp_log_verbose, a->audio_mode);
+    sp_log("prefs: server=%s user=%s enabled=%d transport=%d secure=%d verbose=%d audio=%d", c.server,
+           c.user, c.do_register, c.transport, c.secure, sp_log_verbose, a->audio_mode);
 }
 
 /* ----------------------------------------------------- state publishing */
@@ -228,12 +241,27 @@ static void write_state(app *a)
     if (data) {
         char tmp[320];
         snprintf(tmp, sizeof tmp, "%s.tmp", SP_STATE_PATH);
-        FILE *f = fopen(tmp, "wb");
-        if (f) {
-            fwrite(CFDataGetBytePtr(data), 1, (size_t)CFDataGetLength(data), f);
-            fclose(f);
-            rename(tmp, SP_STATE_PATH);
-            chmod(SP_STATE_PATH, 0644);
+        unlink(tmp);
+        int fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL, 0600);   /* never world-readable */
+        if (fd >= 0) {
+            fchown(fd, MOBILE_UID, MOBILE_UID);                  /* the UI tweaks run as mobile */
+            const UInt8 *p = CFDataGetBytePtr(data);
+            size_t left = (size_t)CFDataGetLength(data);
+            int ok = 1;
+            while (left > 0) {
+                ssize_t w = write(fd, p, left);
+                if (w <= 0) {
+                    ok = 0;
+                    break;
+                }
+                p += w;
+                left -= (size_t)w;
+            }
+            close(fd);
+            if (ok)
+                rename(tmp, SP_STATE_PATH);
+            else
+                unlink(tmp);
         }
         CFRelease(data);
     }
@@ -339,7 +367,13 @@ static void hook_send(void *ctx, const char *data, size_t len)
     if (a->sip_fd < 0)
         return;
     ssize_t r;
-    if (a->cfg.transport == SP_TP_TCP) {
+    if (a->cfg.transport == SP_TP_TLS) {
+        if (!a->tcp_connected || !a->tls)
+            return;
+        r = sp_tls_write(a->tls, data, len);
+        if (r == 0)
+            r = (ssize_t)len;      /* would-block: TLS buffers it; treat as sent */
+    } else if (a->cfg.transport == SP_TP_TCP) {
         if (!a->tcp_connected)
             return;
         r = send(a->sip_fd, data, len, 0);
@@ -367,27 +401,36 @@ static void hook_changed(void *ctx)
     publish(a, 0);
 }
 
-static void hook_media(void *ctx, int on, const char *ip, int port, int pt, int dtmf_pt, int dir)
+static void hook_media(void *ctx, const sp_media_info *m)
 {
     app *a = ctx;
-    if (!on) {
+    if (!m->on) {
         stop_audio(a);
         return;
     }
     a->rtp_remote.sin_family = AF_INET;
-    a->rtp_remote.sin_port = htons((uint16_t)port);
-    inet_pton(AF_INET, ip, &a->rtp_remote.sin_addr);
+    a->rtp_remote.sin_port = htons((uint16_t)m->port);
+    inet_pton(AF_INET, m->ip, &a->rtp_remote.sin_addr);
     a->rtp_have_remote = 1;
     a->rtp_mismatch_logged = 0;
     a->media_on = 1;
-    a->media_pt = pt;
-    a->media_dtmf = dtmf_pt;
-    a->media_send = dir == SP_DIR_SENDRECV || dir == SP_DIR_SENDONLY;
-    a->media_recv = dir == SP_DIR_SENDRECV || dir == SP_DIR_RECVONLY;
-    if (ensure_audio(a) == 0)
-        sp_audio_reconfigure(a->audio, pt, dtmf_pt, a->media_send, a->media_recv);
+    a->media_pt = m->pt;
+    a->media_dtmf = m->dtmf_pt;
+    a->media_send = m->dir == SP_DIR_SENDRECV || m->dir == SP_DIR_SENDONLY;
+    a->media_recv = m->dir == SP_DIR_SENDRECV || m->dir == SP_DIR_RECVONLY;
+    a->media_secure = m->secure;
+    if (m->secure) {                            /* keys are valid only in this callback */
+        memcpy(a->media_tx_key, m->tx_key, SP_SDES_KEYING);
+        memcpy(a->media_rx_key, m->rx_key, SP_SDES_KEYING);
+    }
+    if (ensure_audio(a) == 0) {
+        sp_audio_set_srtp(a->audio, m->secure ? a->media_tx_key : NULL,
+                          m->secure ? a->media_rx_key : NULL);
+        sp_audio_reconfigure(a->audio, m->pt, m->dtmf_pt, a->media_send, a->media_recv);
+    }
     apply_mute(a);
-    sp_log("media up -> %s:%d pt%d dir%d", ip, port, pt, dir);
+    sp_log("media up -> %s:%d pt%d dir%d%s", m->ip, m->port, m->pt, m->dir,
+           m->secure ? " [SRTP]" : "");
 }
 
 static void hook_tone(void *ctx, int tone)
@@ -445,11 +488,12 @@ static int open_rtp(app *a)
 static int resolve_server(app *a, struct sockaddr_in *out)
 {
     char portstr[16];
-    snprintf(portstr, sizeof portstr, "%d", a->cfg.port ? a->cfg.port : 5060);
+    int defport = a->cfg.transport == SP_TP_TLS ? 5061 : 5060;
+    snprintf(portstr, sizeof portstr, "%d", a->cfg.port ? a->cfg.port : defport);
     struct addrinfo hints, *res = NULL;
     memset(&hints, 0, sizeof hints);
     hints.ai_family = AF_INET;
-    hints.ai_socktype = a->cfg.transport == SP_TP_TCP ? SOCK_STREAM : SOCK_DGRAM;
+    hints.ai_socktype = a->cfg.transport == SP_TP_UDP ? SOCK_DGRAM : SOCK_STREAM;
     if (getaddrinfo(a->cfg.server, portstr, &hints, &res) != 0 || !res) {
         sp_log("cannot resolve %s", a->cfg.server);
         return -1;
@@ -479,6 +523,11 @@ static void discover_local_ip(app *a)
 static void sip_down(app *a, const char *why)
 {
     sp_log("sip transport down: %s", why);
+    if (a->tls) {
+        sp_tls_free(a->tls);
+        a->tls = NULL;
+    }
+    a->tls_handshaking = 0;
     if (a->sip_fd >= 0)
         close(a->sip_fd);
     a->sip_fd = -1;
@@ -509,12 +558,17 @@ static int open_sip(app *a)
         return -1;
     if (a->sip_fd >= 0)
         close(a->sip_fd);
+    if (a->tls) {
+        sp_tls_free(a->tls);
+        a->tls = NULL;
+    }
+    a->tls_handshaking = 0;
     a->sip_fd = -1;
     a->tcp_connected = a->tcp_connecting = 0;
     a->tcp_rxlen = 0;
     a->server_addr = srv;
     discover_local_ip(a);
-    if (a->cfg.transport == SP_TP_TCP) {
+    if (a->cfg.transport != SP_TP_UDP) {        /* TCP or TLS: a stream socket */
         a->sip_fd = socket(AF_INET, SOCK_STREAM, 0);
         int one = 1;
         setsockopt(a->sip_fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
@@ -546,11 +600,28 @@ static int open_sip(app *a)
     }
     sp_ua_set_local(a->ua, a->local_ip, a->local_port);
     sp_ua_set_rtp_port(a->ua, a->rtp_port);
-    if (a->cfg.transport != SP_TP_TCP)
+    if (a->cfg.transport == SP_TP_UDP)
         a->sip_backoff_ms = 0;
     a->sip_retry_at = 0;
     sp_log("sip socket up local %s:%d -> %s", a->local_ip, a->local_port, a->cfg.server);
     return 0;
+}
+
+/* TLS handshake runs across poll iterations once the TCP connect completes. */
+static void drive_tls(app *a)
+{
+    if (!a->tls_handshaking || !a->tls)
+        return;
+    int r = sp_tls_handshake(a->tls);
+    if (r == 1) {
+        a->tls_handshaking = 0;
+        a->tcp_connected = 1;
+        a->sip_backoff_ms = 0;
+        sp_log("tls established to %s", a->cfg.server);
+        sp_ua_refresh_now(a->ua);
+    } else if (r < 0) {
+        sip_down(a, "tls handshake failed");
+    }
 }
 
 static void on_tcp_writable(app *a)
@@ -565,16 +636,27 @@ static void on_tcp_writable(app *a)
         return;
     }
     a->tcp_connecting = 0;
-    a->tcp_connected = 1;
-    a->sip_backoff_ms = 0;
     struct sockaddr_in got;
     socklen_t gl = sizeof got;
     getsockname(a->sip_fd, (struct sockaddr *)&got, &gl);
     a->local_port = ntohs(got.sin_port);
     inet_ntop(AF_INET, &got.sin_addr, a->local_ip, sizeof a->local_ip);
     sp_ua_set_local(a->ua, a->local_ip, a->local_port);
-    sp_log("tcp connected, local %s:%d", a->local_ip, a->local_port);
-    sp_ua_refresh_now(a->ua);
+    if (a->cfg.transport == SP_TP_TLS) {
+        a->tls = sp_tls_new(a->sip_fd, a->cfg.server);
+        if (!a->tls) {
+            sip_down(a, "tls init failed");
+            return;
+        }
+        a->tls_handshaking = 1;
+        sp_log("tcp connected, starting tls to %s", a->cfg.server);
+        drive_tls(a);
+    } else {
+        a->tcp_connected = 1;
+        a->sip_backoff_ms = 0;
+        sp_log("tcp connected, local %s:%d", a->local_ip, a->local_port);
+        sp_ua_refresh_now(a->ua);
+    }
 }
 
 /* Wi-Fi <-> LTE or a new address: no DNS here (reuses server_addr), and it
@@ -595,7 +677,7 @@ static void net_changed(app *a)
         return;
     }
     int ipchg = strcmp(old, a->local_ip) != 0;
-    if (a->cfg.transport == SP_TP_TCP) {
+    if (a->cfg.transport != SP_TP_UDP) {        /* TCP/TLS: reconnect on a new local address */
         if (ipchg) {
             sip_down(a, "network changed");
             a->sip_retry_at = sp_now_ms();
@@ -619,13 +701,30 @@ static void on_sip_readable(app *a)
 {
     if (a->sip_fd < 0)
         return;
-    if (a->cfg.transport == SP_TP_TCP) {
-        ssize_t r = recv(a->sip_fd, a->tcp_rxbuf + a->tcp_rxlen,
-                         sizeof a->tcp_rxbuf - a->tcp_rxlen, 0);
-        if (r <= 0) {
-            if (r == 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR))
-                sip_down(a, r == 0 ? "tcp closed by server" : strerror(errno));
-            return;
+    if (a->tls_handshaking) {
+        drive_tls(a);
+        return;
+    }
+    if (a->cfg.transport != SP_TP_UDP) {
+        ssize_t r;
+        if (a->cfg.transport == SP_TP_TLS) {
+            if (!a->tls)
+                return;
+            r = sp_tls_read(a->tls, a->tcp_rxbuf + a->tcp_rxlen, sizeof a->tcp_rxbuf - a->tcp_rxlen);
+            if (r == 0)
+                return;                         /* would block */
+            if (r < 0) {
+                sip_down(a, "tls closed by server");
+                return;
+            }
+        } else {
+            r = recv(a->sip_fd, a->tcp_rxbuf + a->tcp_rxlen,
+                     sizeof a->tcp_rxbuf - a->tcp_rxlen, 0);
+            if (r <= 0) {
+                if (r == 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR))
+                    sip_down(a, r == 0 ? "tcp closed by server" : strerror(errno));
+                return;
+            }
         }
         a->tcp_rxlen += (size_t)r;
         for (;;) {
@@ -813,19 +912,19 @@ static void handle_command(app *a, int idx, char *line)
     } else if (sp_strcaseeq(line, "HANGUP")) {
         sp_ua_hangup(a->ua);
     } else if (sp_strcaseeq(line, "HOLD")) {
-        sp_ua_hold(a->ua, atoi(arg));
+        sp_ua_hold(a->ua, atoi(arg) != 0);
         apply_mute(a);                    /* hold also silences the mic */
         publish(a, 0);
     } else if (sp_strcaseeq(line, "MUTE")) {
-        a->muted = atoi(arg);
+        a->muted = atoi(arg) != 0;
         apply_mute(a);
         publish(a, 0);
     } else if (sp_strcaseeq(line, "SPEAKER")) {
-        a->speaker = atoi(arg);
+        a->speaker = atoi(arg) != 0;
         sp_audio_set_speaker(a->audio, a->speaker);   /* safe while audio is stopped */
         publish(a, 0);
     } else if (sp_strcaseeq(line, "DTMF")) {
-        if (a->audio_up && arg[0])
+        if (a->audio_up && arg[0] && strchr("0123456789*#ABCDabcd", arg[0]))
             sp_audio_send_dtmf(a->audio, arg[0]);
     } else if (sp_strcaseeq(line, "RELOAD")) {
         apply_prefs(a, 1);
@@ -891,6 +990,13 @@ static void on_ctl_accept(app *a)
     int fd = accept(a->ctl_listen, NULL, NULL);
     if (fd < 0)
         return;
+    uid_t uid = (uid_t)-1;
+    gid_t gid = (gid_t)-1;
+    if (getpeereid(fd, &uid, &gid) != 0 || (uid != 0 && uid != MOBILE_UID)) {
+        sp_log("control: refused a client running as uid %d", (int)uid);
+        close(fd);
+        return;
+    }
     int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
     fcntl(fd, F_SETFL, O_NONBLOCK);
@@ -920,7 +1026,10 @@ static int open_control(app *a)
         sp_log("control bind failed: %s", strerror(errno));
         return -1;
     }
-    chmod(SP_SOCK_PATH, 0666);   /* mobile (Phone/SpringBoard) must connect */
+    /* Only the UI tweaks (running as mobile) and root may connect: the socket can
+       place calls. Ownership + 0600 here, and a peer-uid check on every accept. */
+    chown(SP_SOCK_PATH, MOBILE_UID, MOBILE_UID);
+    chmod(SP_SOCK_PATH, 0600);
     listen(a->ctl_listen, 8);
     fcntl(a->ctl_listen, F_SETFL, O_NONBLOCK);
     return 0;
@@ -981,8 +1090,8 @@ int main(void)
         if (a->sip_fd >= 0) {
             pf[n].fd = a->sip_fd;
             pf[n].events = POLLIN;
-            if (a->cfg.transport == SP_TP_TCP && a->tcp_connecting)
-                pf[n].events |= POLLOUT;
+            if (a->cfg.transport != SP_TP_UDP && (a->tcp_connecting || a->tls_handshaking))
+                pf[n].events |= POLLOUT;   /* connect, and the TLS handshake may need to write */
             i_sip = n++;
         }
         if (a->rtp_fd >= 0) {
@@ -1036,8 +1145,12 @@ int main(void)
 
         int prev_state = g_prev_call_state;
 
-        if (i_sip >= 0 && a->sip_fd >= 0 && (pf[i_sip].revents & POLLOUT))
-            on_tcp_writable(a);
+        if (i_sip >= 0 && a->sip_fd >= 0 && (pf[i_sip].revents & POLLOUT)) {
+            if (a->tcp_connecting)
+                on_tcp_writable(a);
+            else if (a->tls_handshaking)
+                drive_tls(a);
+        }
         if (i_sip >= 0 && a->sip_fd >= 0 && (pf[i_sip].revents & (POLLIN | POLLHUP | POLLERR)))
             on_sip_readable(a);
         if (i_rtp >= 0 && (pf[i_rtp].revents & POLLIN))
@@ -1096,6 +1209,8 @@ int main(void)
             a->audio_retry_at = sp_now_ms() + 1000;
             a->audio_up = 0;
             if (ensure_audio(a) == 0) {
+                sp_audio_set_srtp(a->audio, a->media_secure ? a->media_tx_key : NULL,
+                                  a->media_secure ? a->media_rx_key : NULL);
                 sp_audio_reconfigure(a->audio, a->media_pt, a->media_dtmf, a->media_send, a->media_recv);
                 apply_mute(a);
             }

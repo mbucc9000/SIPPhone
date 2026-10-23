@@ -1,4 +1,5 @@
 #include "sp_sdp.h"
+#include "sp_srtp.h"
 #include "sp_util.h"
 
 #include <stdio.h>
@@ -64,7 +65,9 @@ int sp_sdp_parse(const char *body, size_t len, sp_sdp *o)
                 seen_audio = in_audio = 1;
                 const char *q = v + 6;
                 o->port = atoi(q);
-                q = strchr(q, ' ');          /* proto */
+                q = strchr(q, ' ');          /* -> proto */
+                if (q && strncmp(q + 1, "RTP/SAVP", 8) == 0)
+                    o->savp = 1;
                 if (q)
                     q = strchr(q + 1, ' ');  /* fmt list */
                 while (q && *q) {
@@ -100,6 +103,20 @@ int sp_sdp_parse(const char *body, size_t len, sp_sdp *o)
                     o->dtmf_pt = pt;
             } else if (in_audio && strncmp(v, "ptime:", 6) == 0) {
                 o->ptime = atoi(v + 6);
+            } else if (in_audio && strncmp(v, "crypto:", 7) == 0 && !o->have_crypto) {
+                /* a=crypto:<tag> AES_CM_128_HMAC_SHA1_80 inline:<b64>[|...] [params] */
+                const char *q = v + 7;
+                int tag = atoi(q);
+                const char *suite = strchr(q, ' ');
+                if (tag > 0 && suite && sp_strncaseeq(suite + 1, "AES_CM_128_HMAC_SHA1_80", 23)) {
+                    const char *inl = strstr(suite, "inline:");
+                    uint8_t key[SP_SDES_KEYING];
+                    if (inl && sp_srtp_keying_from_b64(inl + 7, key) == 0) {
+                        memcpy(o->crypto_key, key, SP_SDES_KEYING);
+                        o->crypto_tag = tag;
+                        o->have_crypto = 1;
+                    }
+                }
             }
         }
     }
@@ -138,18 +155,25 @@ int sp_sdp_answer_dir(int remote_dir, int local_hold)
 }
 
 void sp_sdp_build(char *out, size_t n, const char *ip, int port, uint32_t sess_id,
-                  uint32_t ver, const int *pts, int npts, int dtmf_pt, int dir)
+                  uint32_t ver, const int *pts, int npts, int dtmf_pt, int dir,
+                  const uint8_t *srtp_key, int crypto_tag)
 {
     sp_buf b;
     sp_buf_init(&b);
     sp_buf_printf(&b, "v=0\r\no=- %u %u IN IP4 %s\r\ns=SIPPhone\r\nc=IN IP4 %s\r\nt=0 0\r\n",
                   sess_id, ver, ip, ip);
-    sp_buf_printf(&b, "m=audio %d RTP/AVP", port);
+    sp_buf_printf(&b, "m=audio %d %s", port, srtp_key ? "RTP/SAVP" : "RTP/AVP");
     for (int i = 0; i < npts; i++)
         sp_buf_printf(&b, " %d", pts[i]);
     if (dtmf_pt >= 0)
         sp_buf_printf(&b, " %d", dtmf_pt);
     sp_buf_puts(&b, "\r\n");
+    if (srtp_key) {
+        char kb[41];
+        sp_srtp_keying_to_b64(srtp_key, kb);
+        sp_buf_printf(&b, "a=crypto:%d AES_CM_128_HMAC_SHA1_80 inline:%s\r\n",
+                      crypto_tag > 0 ? crypto_tag : 1, kb);
+    }
     for (int i = 0; i < npts; i++) {
         if (pts[i] == 0)
             sp_buf_puts(&b, "a=rtpmap:0 PCMU/8000\r\n");
