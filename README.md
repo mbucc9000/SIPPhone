@@ -18,6 +18,7 @@ Make and receive VoIP.ms calls through the stock iOS 6 Phone app, with a stock-s
 2. Settings › SIP Phone: enter the server (like chicago4.voip.ms), the sub-account and its password, then turn on SIP enabled. Status shows Registered.
 3. Dial from the Phone app as usual. Call 4443 for VoIP.ms's echo test.
 4. To encrypt your calls: go to voip.ms, log in, go to Sub Accounts, then Manage Sub Accounts, and switch Encrypted SIP Traffic to Yes. Then in Settings › SIP Phone › Security, turn on Encrypted calls. Both must be on together.
+5. To show your own number on outgoing calls: at voip.ms, edit your sub-account, and by CallerID Number click the link to verify your real number (it sends a code by call or text). Enter the code, then pick that number as the Caller ID. Calls then show your number, not the VoIP.ms one.
 
 ## Requirements
 
